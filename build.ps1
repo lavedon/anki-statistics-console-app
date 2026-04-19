@@ -1,7 +1,7 @@
 dotnet publish -c Release --arch x64 --nologo --self-contained true
 
 $src = "C:\my-coding-projects\ankiStats\bin\Release\net10.0\win-x64\publish\ankiStats.exe"
-$dst = "C:\tools\ankiStats.exe"
+$dst = "C:\tools\as.exe"
 
 try {
     Copy-Item -Path $src -Destination $dst -Force
