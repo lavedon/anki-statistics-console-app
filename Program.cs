@@ -188,8 +188,32 @@ void DoImport()
 
 void LogProblem(int number, string? desc, string? link, long? ankiId)
 {
-    tracker.LogReview(number, desc, link, ankiId);
-    var row = tracker.GetByProblemNumber(number)!;
+    var ambiguous = tracker.LogReview(number, desc, link, ankiId);
+
+    if (ambiguous is not null)
+    {
+        if (plain)
+        {
+            Console.WriteLine($"Multiple variants exist for problem #{number}. Use --anki-id to pick one:");
+            foreach (var v in ambiguous)
+                Console.WriteLine($"  --anki-id {v.AnkiCardId}  {v.Description}");
+        }
+        else
+        {
+            AnsiConsole.MarkupLine($"[yellow]Multiple variants exist for problem #{number}.[/] Use [bold]--anki-id[/] to disambiguate:");
+            foreach (var v in ambiguous)
+            {
+                var d = v.Description is null ? "" : Markup.Escape(v.Description);
+                AnsiConsole.MarkupLine($"  [dim]--anki-id[/] [cyan]{v.AnkiCardId}[/]  {d}");
+            }
+        }
+        return;
+    }
+
+    LeetcodeProblem? row = ankiId.HasValue
+        ? tracker.GetByAnkiCardId(ankiId.Value)
+        : tracker.GetByProblemNumber(number);
+    if (row is null) return;
     var isoLocal = row.LastReviewed!.Value.LocalDateTime.ToString("MM-dd-yy HH:mm");
 
     if (plain)
@@ -258,17 +282,13 @@ void RunInteractive()
     }
 }
 
-int? PickProblemInteractively(string title)
+PickedProblem? PickProblemInteractively(string title)
 {
     var rawCards = repo.GetCardIntervals();
-    var trackedByNumber = tracker.GetAllByProblemNumber();
+    var trackedByCardId = tracker.GetAllByAnkiCardId();
 
-    DateTimeOffset? LastReview(CardInterval c)
-    {
-        var parsed = ProblemParser.Parse(c.SortField);
-        if (parsed is null) return null;
-        return trackedByNumber.TryGetValue(parsed.Number, out var p) ? p.LastReviewed : null;
-    }
+    DateTimeOffset? LastReview(CardInterval c) =>
+        trackedByCardId.TryGetValue(c.CardId, out var p) ? p.LastReviewed : null;
 
     var currentCards = (sortMode, reverseSort) switch
     {
@@ -280,19 +300,20 @@ int? PickProblemInteractively(string title)
         _                             => rawCards
     };
 
-    var labelToNumber = new Dictionary<string, int>();
+    var labelToCardId = new Dictionary<string, long>();
     foreach (var card in currentCards)
     {
         var parsed = ProblemParser.Parse(card.SortField);
-        if (parsed is null) continue;
-        var label = $"#{parsed.Number,-5} {parsed.Description}";
-        labelToNumber.TryAdd(label, parsed.Number);
+        string label = parsed is null
+            ? $"[card {card.CardId}] {Truncate(card.SortField, 60)}"
+            : $"#{parsed.Number,-5} {Truncate(parsed.Description, 60)}  [card {card.CardId}]";
+        labelToCardId.TryAdd(label, card.CardId);
     }
 
     const string ManualChoice = "Enter problem number manually…";
     const string CancelChoice = "Cancel";
 
-    var options = new List<string>(labelToNumber.Keys) { ManualChoice, CancelChoice };
+    var options = new List<string>(labelToCardId.Keys) { ManualChoice, CancelChoice };
 
     var choice = AnsiConsole.Prompt(
         new SelectionPrompt<string>()
@@ -304,35 +325,94 @@ int? PickProblemInteractively(string title)
 
     if (choice == ManualChoice)
     {
-        return AnsiConsole.Prompt(
+        var num = AnsiConsole.Prompt(
             new TextPrompt<int>("LeetCode problem number:")
                 .Validate(n => n > 0 ? ValidationResult.Success() : ValidationResult.Error("Must be positive")));
+        return new PickedProblem(null, num);
     }
 
-    return labelToNumber[choice];
+    return new PickedProblem(labelToCardId[choice], null);
 }
 
 void DoInteractiveLog()
 {
-    var number = PickProblemInteractively("Which problem did you review?");
-    if (number is null) return;
+    var picked = PickProblemInteractively("Which problem did you review?");
+    if (picked is null) return;
 
-    tracker.LogReview(number.Value, null, null, null);
-    var row = tracker.GetByProblemNumber(number.Value);
-    var ts = row?.LastReviewed?.LocalDateTime.ToString("MM-dd-yy h:mm:ss tt");
-    AnsiConsole.MarkupLine($"[green]Logged review for problem #{number.Value}[/] at [dim]{ts}[/]");
+    LeetcodeProblem? row = null;
+
+    if (picked.AnkiCardId.HasValue)
+    {
+        bool updated = tracker.LogReviewByCard(picked.AnkiCardId.Value);
+        if (!updated)
+        {
+            AnsiConsole.MarkupLine($"[yellow]Card {picked.AnkiCardId.Value} is not in the tracker DB. Run --import first.[/]");
+        }
+        else
+        {
+            row = tracker.GetByAnkiCardId(picked.AnkiCardId.Value);
+        }
+    }
+    else if (picked.ProblemNumber.HasValue)
+    {
+        var ambiguous = tracker.LogReview(picked.ProblemNumber.Value, null, null, null);
+        if (ambiguous is not null)
+        {
+            AnsiConsole.MarkupLine($"[yellow]Multiple variants exist for #{picked.ProblemNumber.Value}:[/]");
+            foreach (var v in ambiguous)
+                AnsiConsole.MarkupLine($"  [cyan]anki-id {v.AnkiCardId}[/]  {Markup.Escape(v.Description ?? "")}");
+            AnsiConsole.MarkupLine("[dim]Pick the specific variant from the menu list instead, or use the CLI with --anki-id.[/]");
+        }
+        else
+        {
+            row = tracker.GetByProblemNumber(picked.ProblemNumber.Value);
+        }
+    }
+
+    if (row is not null)
+    {
+        var ts = row.LastReviewed?.LocalDateTime.ToString("MM-dd-yy h:mm:ss tt");
+        AnsiConsole.MarkupLine($"[green]Logged review for problem #{row.ProblemNumber}[/] at [dim]{ts}[/]");
+    }
+
     AnsiConsole.MarkupLine("[dim]Press any key to continue…[/]");
     Console.ReadKey(intercept: true);
 }
 
 void DoInteractiveOpen()
 {
-    var number = PickProblemInteractively("Which problem do you want to open?");
-    if (number is null) return;
+    var picked = PickProblemInteractively("Which problem do you want to open?");
+    if (picked is null) return;
 
-    OpenProblem(number.Value);
+    LeetcodeProblem? row = picked.AnkiCardId.HasValue
+        ? tracker.GetByAnkiCardId(picked.AnkiCardId.Value)
+        : picked.ProblemNumber.HasValue ? tracker.GetByProblemNumber(picked.ProblemNumber.Value) : null;
+
+    if (row is null)
+        PrintError("Problem not found in the tracker DB.");
+    else if (string.IsNullOrWhiteSpace(row.Link))
+        PrintError($"Problem #{row.ProblemNumber} has no link.");
+    else
+        OpenUrlSafe(row.Link, row.ProblemNumber);
+
     AnsiConsole.MarkupLine("[dim]Press any key to continue…[/]");
     Console.ReadKey(intercept: true);
+}
+
+void OpenUrlSafe(string link, int problemNumber)
+{
+    if (plain)
+        Console.WriteLine($"Opening {link}");
+    else
+        AnsiConsole.MarkupLine($"[green]Opening[/] [dim]{Markup.Escape(link)}[/]");
+    try
+    {
+        Process.Start(new ProcessStartInfo(link) { UseShellExecute = true });
+    }
+    catch (Exception ex)
+    {
+        PrintError($"Failed to launch browser for #{problemNumber}: {ex.Message}");
+    }
 }
 
 void OpenProblem(int number)
@@ -348,20 +428,7 @@ void OpenProblem(int number)
         PrintError($"Problem #{number} has no link. Set one via --log {number} --link \"<url>\".");
         return;
     }
-
-    if (plain)
-        Console.WriteLine($"Opening {row.Link}");
-    else
-        AnsiConsole.MarkupLine($"[green]Opening[/] [dim]{Markup.Escape(row.Link)}[/]");
-
-    try
-    {
-        Process.Start(new ProcessStartInfo(row.Link) { UseShellExecute = true });
-    }
-    catch (Exception ex)
-    {
-        PrintError($"Failed to launch browser: {ex.Message}");
-    }
+    OpenUrlSafe(row.Link, number);
 }
 
 // ── Display ───────────────────────────────────────────────────────
@@ -376,15 +443,10 @@ void ShowSummary()
         return;
     }
 
-    var trackedByNumber = tracker.GetAllByProblemNumber();
+    var trackedByCardId = tracker.GetAllByAnkiCardId();
 
-    DateTimeOffset? LastReviewTimestamp(CardInterval card)
-    {
-        var parsed = ProblemParser.Parse(card.SortField);
-        if (parsed is null) return null;
-        if (!trackedByNumber.TryGetValue(parsed.Number, out var problem)) return null;
-        return problem.LastReviewed;
-    }
+    DateTimeOffset? LastReviewTimestamp(CardInterval card) =>
+        trackedByCardId.TryGetValue(card.CardId, out var problem) ? problem.LastReviewed : null;
 
     string LastReviewFor(CardInterval card)
     {

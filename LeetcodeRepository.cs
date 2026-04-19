@@ -27,17 +27,21 @@ class LeetcodeRepository : IDisposable
         Initialize();
     }
 
-    private const int SchemaVersion = 1;
+    private const int SchemaVersion = 2;
 
     private void Initialize()
     {
         long current = GetUserVersion();
-        if (current >= SchemaVersion) return;
 
-        if (TableExists("LeetcodeProblems"))
-            MigrateToV1();
-        else
+        if (!TableExists("LeetcodeProblems"))
+        {
             CreateSchema();
+            SetUserVersion(SchemaVersion);
+            return;
+        }
+
+        if (current < 1) MigrateV0toV1();
+        if (current < 2) MigrateV1toV2();
 
         SetUserVersion(SchemaVersion);
     }
@@ -48,20 +52,22 @@ class LeetcodeRepository : IDisposable
         cmd.CommandText = """
             CREATE TABLE LeetcodeProblems (
                 ProblemId       INTEGER PRIMARY KEY AUTOINCREMENT,
-                ProblemNumber   INTEGER NOT NULL UNIQUE,
+                ProblemNumber   INTEGER NOT NULL,
                 Description     TEXT,
                 Link            TEXT,
-                AnkiCardId      INTEGER,
+                AnkiCardId      INTEGER UNIQUE,
                 LastReviewed    TEXT,
                 CreatedAt       TEXT NOT NULL
             );
             CREATE INDEX idx_leetcode_last_reviewed
                 ON LeetcodeProblems(LastReviewed);
+            CREATE INDEX idx_leetcode_problem_number
+                ON LeetcodeProblems(ProblemNumber);
             """;
         cmd.ExecuteNonQuery();
     }
 
-    private void MigrateToV1()
+    private void MigrateV0toV1()
     {
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
@@ -83,6 +89,34 @@ class LeetcodeRepository : IDisposable
             DROP TABLE LeetcodeProblems;
             ALTER TABLE LeetcodeProblems_new RENAME TO LeetcodeProblems;
             CREATE INDEX idx_leetcode_last_reviewed ON LeetcodeProblems(LastReviewed);
+            COMMIT;
+            """;
+        cmd.ExecuteNonQuery();
+    }
+
+    private void MigrateV1toV2()
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            BEGIN;
+            CREATE TABLE LeetcodeProblems_new (
+                ProblemId       INTEGER PRIMARY KEY AUTOINCREMENT,
+                ProblemNumber   INTEGER NOT NULL,
+                Description     TEXT,
+                Link            TEXT,
+                AnkiCardId      INTEGER UNIQUE,
+                LastReviewed    TEXT,
+                CreatedAt       TEXT NOT NULL
+            );
+            INSERT INTO LeetcodeProblems_new
+                (ProblemId, ProblemNumber, Description, Link, AnkiCardId, LastReviewed, CreatedAt)
+            SELECT
+                ProblemId, ProblemNumber, Description, Link, AnkiCardId, LastReviewed, CreatedAt
+            FROM LeetcodeProblems;
+            DROP TABLE LeetcodeProblems;
+            ALTER TABLE LeetcodeProblems_new RENAME TO LeetcodeProblems;
+            CREATE INDEX idx_leetcode_last_reviewed ON LeetcodeProblems(LastReviewed);
+            CREATE INDEX idx_leetcode_problem_number ON LeetcodeProblems(ProblemNumber);
             COMMIT;
             """;
         cmd.ExecuteNonQuery();
@@ -110,37 +144,99 @@ class LeetcodeRepository : IDisposable
         cmd.ExecuteNonQuery();
     }
 
-    public void LogReview(int problemNumber, string? description, string? link, long? ankiCardId)
+    /// Log a review by AnkiCardId directly (unambiguous). Returns true if a row was updated.
+    public bool LogReviewByCard(long ankiCardId, string? description = null, string? link = null)
+    {
+        var now = DateTimeOffset.UtcNow.ToString("o");
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE LeetcodeProblems SET
+                LastReviewed = @now,
+                Description  = COALESCE(@desc, Description),
+                Link         = COALESCE(@link, Link)
+            WHERE AnkiCardId = @anki;
+            """;
+        cmd.Parameters.AddWithValue("@now", now);
+        cmd.Parameters.AddWithValue("@desc", (object?)description ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@link", (object?)link ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@anki", ankiCardId);
+        return cmd.ExecuteNonQuery() > 0;
+    }
+
+    /// Log a review via problem number. Returns the variants list if >1 match (caller must disambiguate).
+    /// Returns null on success (inserted or updated a single row).
+    public List<LeetcodeProblem>? LogReview(int problemNumber, string? description, string? link, long? ankiCardId)
     {
         var now = DateTimeOffset.UtcNow.ToString("o");
 
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
+        if (ankiCardId.HasValue)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO LeetcodeProblems
+                    (ProblemNumber, Description, Link, AnkiCardId, LastReviewed, CreatedAt)
+                VALUES
+                    (@num, @desc, @link, @anki, @now, @now)
+                ON CONFLICT(AnkiCardId) DO UPDATE SET
+                    LastReviewed  = @now,
+                    ProblemNumber = @num,
+                    Description   = COALESCE(@desc, Description),
+                    Link          = COALESCE(@link, Link);
+                """;
+            cmd.Parameters.AddWithValue("@num", problemNumber);
+            cmd.Parameters.AddWithValue("@desc", (object?)description ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@link", (object?)link ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@anki", ankiCardId.Value);
+            cmd.Parameters.AddWithValue("@now", now);
+            cmd.ExecuteNonQuery();
+            return null;
+        }
+
+        var variants = GetAllByProblemNumberAsList(problemNumber);
+        if (variants.Count > 1) return variants;
+
+        if (variants.Count == 1)
+        {
+            var row = variants[0];
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = """
+                UPDATE LeetcodeProblems SET
+                    LastReviewed = @now,
+                    Description  = COALESCE(@desc, Description),
+                    Link         = COALESCE(@link, Link)
+                WHERE ProblemId = @pid;
+                """;
+            cmd.Parameters.AddWithValue("@now", now);
+            cmd.Parameters.AddWithValue("@desc", (object?)description ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@link", (object?)link ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@pid", row.ProblemId);
+            cmd.ExecuteNonQuery();
+            return null;
+        }
+
+        // Zero rows: insert a new orphan (no AnkiCardId yet)
+        using var insertCmd = _conn.CreateCommand();
+        insertCmd.CommandText = """
             INSERT INTO LeetcodeProblems
                 (ProblemNumber, Description, Link, AnkiCardId, LastReviewed, CreatedAt)
             VALUES
-                (@num, @desc, @link, @anki, @now, @now)
-            ON CONFLICT(ProblemNumber) DO UPDATE SET
-                LastReviewed = @now,
-                Description  = COALESCE(@desc, Description),
-                Link         = COALESCE(@link, Link),
-                AnkiCardId   = COALESCE(@anki, AnkiCardId);
+                (@num, @desc, @link, NULL, @now, @now);
             """;
-        cmd.Parameters.AddWithValue("@num", problemNumber);
-        cmd.Parameters.AddWithValue("@desc", (object?)description ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@link", (object?)link ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@anki", (object?)ankiCardId ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@now", now);
-        cmd.ExecuteNonQuery();
+        insertCmd.Parameters.AddWithValue("@num", problemNumber);
+        insertCmd.Parameters.AddWithValue("@desc", (object?)description ?? DBNull.Value);
+        insertCmd.Parameters.AddWithValue("@link", (object?)link ?? DBNull.Value);
+        insertCmd.Parameters.AddWithValue("@now", now);
+        insertCmd.ExecuteNonQuery();
+        return null;
     }
 
-    public UpsertResult UpsertCatalog(int problemNumber, string? description, string? link, long? ankiCardId)
+    public UpsertResult UpsertCatalog(int problemNumber, string? description, string? link, long ankiCardId)
     {
         var now = DateTimeOffset.UtcNow.ToString("o");
 
         using var existsCmd = _conn.CreateCommand();
-        existsCmd.CommandText = "SELECT COUNT(*) FROM LeetcodeProblems WHERE ProblemNumber = @num";
-        existsCmd.Parameters.AddWithValue("@num", problemNumber);
+        existsCmd.CommandText = "SELECT COUNT(*) FROM LeetcodeProblems WHERE AnkiCardId = @id";
+        existsCmd.Parameters.AddWithValue("@id", ankiCardId);
         bool existed = (long)existsCmd.ExecuteScalar()! > 0;
 
         using var cmd = _conn.CreateCommand();
@@ -149,15 +245,15 @@ class LeetcodeRepository : IDisposable
                 (ProblemNumber, Description, Link, AnkiCardId, LastReviewed, CreatedAt)
             VALUES
                 (@num, @desc, @link, @anki, NULL, @now)
-            ON CONFLICT(ProblemNumber) DO UPDATE SET
-                Description = COALESCE(Description, @desc),
-                Link        = COALESCE(Link, @link),
-                AnkiCardId  = COALESCE(@anki, AnkiCardId);
+            ON CONFLICT(AnkiCardId) DO UPDATE SET
+                ProblemNumber = @num,
+                Description   = COALESCE(Description, @desc),
+                Link          = COALESCE(Link, @link);
             """;
         cmd.Parameters.AddWithValue("@num", problemNumber);
         cmd.Parameters.AddWithValue("@desc", (object?)description ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@link", (object?)link ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@anki", (object?)ankiCardId ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@anki", ankiCardId);
         cmd.Parameters.AddWithValue("@now", now);
         cmd.ExecuteNonQuery();
 
@@ -184,16 +280,60 @@ class LeetcodeRepository : IDisposable
 
     public LeetcodeProblem? GetByProblemNumber(int problemNumber)
     {
+        var rows = GetAllByProblemNumberAsList(problemNumber);
+        return rows.Count > 0 ? rows[0] : null;
+    }
+
+    public List<LeetcodeProblem> GetAllByProblemNumberAsList(int problemNumber)
+    {
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = """
             SELECT ProblemId, ProblemNumber, Description, Link, AnkiCardId, LastReviewed, CreatedAt
             FROM LeetcodeProblems
             WHERE ProblemNumber = @num
+            ORDER BY ProblemId
             """;
         cmd.Parameters.AddWithValue("@num", problemNumber);
 
+        var results = new List<LeetcodeProblem>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            results.Add(ReadProblem(reader));
+        return results;
+    }
+
+    public LeetcodeProblem? GetByAnkiCardId(long ankiCardId)
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT ProblemId, ProblemNumber, Description, Link, AnkiCardId, LastReviewed, CreatedAt
+            FROM LeetcodeProblems
+            WHERE AnkiCardId = @anki
+            """;
+        cmd.Parameters.AddWithValue("@anki", ankiCardId);
+
         using var reader = cmd.ExecuteReader();
         return reader.Read() ? ReadProblem(reader) : null;
+    }
+
+    public Dictionary<long, LeetcodeProblem> GetAllByAnkiCardId()
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT ProblemId, ProblemNumber, Description, Link, AnkiCardId, LastReviewed, CreatedAt
+            FROM LeetcodeProblems
+            WHERE AnkiCardId IS NOT NULL
+            """;
+
+        var result = new Dictionary<long, LeetcodeProblem>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var problem = ReadProblem(reader);
+            if (problem.AnkiCardId.HasValue)
+                result[problem.AnkiCardId.Value] = problem;
+        }
+        return result;
     }
 
     private static LeetcodeProblem ReadProblem(SqliteDataReader reader) => new(
