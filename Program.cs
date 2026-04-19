@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Spectre.Console;
 
 bool plain = false;
@@ -8,6 +9,8 @@ string? logDescription = null;
 string? logLink = null;
 long? logAnkiId = null;
 bool importMode = false;
+bool hideLastReview = false;
+int? openProblemNumber = null;
 
 for (int i = 0; i < args.Length; i++)
 {
@@ -58,6 +61,17 @@ for (int i = 0; i < args.Length; i++)
         case "import":
             importMode = true;
             break;
+        case "no-last-review":
+            hideLastReview = true;
+            break;
+        case "open" or "o":
+            if (i + 1 >= args.Length || !int.TryParse(args[++i], out int parsedOpenNum))
+            {
+                PrintError("--open requires a problem number");
+                return 1;
+            }
+            openProblemNumber = parsedOpenNum;
+            break;
         case "help" or "h" or "?":
             PrintUsage();
             return 0;
@@ -89,6 +103,12 @@ if (logProblemNumber.HasValue)
 if (importMode)
 {
     DoImport();
+    return 0;
+}
+
+if (openProblemNumber.HasValue)
+{
+    OpenProblem(openProblemNumber.Value);
     return 0;
 }
 
@@ -196,10 +216,12 @@ void RunInteractive()
         ShowSummary();
         Console.WriteLine();
 
+        var toggleLabel = hideLastReview ? "Show Last Review column" : "Hide Last Review column";
+
         var choice = AnsiConsole.Prompt(
             new SelectionPrompt<string>()
                 .Title("What would you like to do?")
-                .AddChoices("Refresh", "Sort by Interval", "Sort by Due", "Exit"));
+                .AddChoices("Log Review", "Open in Browser", "Refresh", "Sort by Interval", "Sort by Due", toggleLabel, "Exit"));
 
         if (choice == "Exit")
             break;
@@ -207,6 +229,102 @@ void RunInteractive()
             sortByDue = true;
         else if (choice == "Sort by Interval")
             sortByDue = false;
+        else if (choice == toggleLabel)
+            hideLastReview = !hideLastReview;
+        else if (choice == "Log Review")
+            DoInteractiveLog();
+        else if (choice == "Open in Browser")
+            DoInteractiveOpen();
+    }
+}
+
+int? PickProblemInteractively(string title)
+{
+    var currentCards = sortByDue
+        ? repo.GetCardIntervals().OrderBy(c => c.Due).ToList()
+        : repo.GetCardIntervals();
+
+    var labelToNumber = new Dictionary<string, int>();
+    foreach (var card in currentCards)
+    {
+        var parsed = ProblemParser.Parse(card.SortField);
+        if (parsed is null) continue;
+        var label = $"#{parsed.Number,-5} {parsed.Description}";
+        labelToNumber.TryAdd(label, parsed.Number);
+    }
+
+    const string ManualChoice = "Enter problem number manually…";
+    const string CancelChoice = "Cancel";
+
+    var options = new List<string>(labelToNumber.Keys) { ManualChoice, CancelChoice };
+
+    var choice = AnsiConsole.Prompt(
+        new SelectionPrompt<string>()
+            .Title(title)
+            .PageSize(15)
+            .AddChoices(options));
+
+    if (choice == CancelChoice) return null;
+
+    if (choice == ManualChoice)
+    {
+        return AnsiConsole.Prompt(
+            new TextPrompt<int>("LeetCode problem number:")
+                .Validate(n => n > 0 ? ValidationResult.Success() : ValidationResult.Error("Must be positive")));
+    }
+
+    return labelToNumber[choice];
+}
+
+void DoInteractiveLog()
+{
+    var number = PickProblemInteractively("Which problem did you review?");
+    if (number is null) return;
+
+    tracker.LogReview(number.Value, null, null, null);
+    var row = tracker.GetByProblemNumber(number.Value);
+    var ts = row?.LastReviewed?.LocalDateTime.ToString("MM-dd-yy h:mm:ss tt");
+    AnsiConsole.MarkupLine($"[green]Logged review for problem #{number.Value}[/] at [dim]{ts}[/]");
+    AnsiConsole.MarkupLine("[dim]Press any key to continue…[/]");
+    Console.ReadKey(intercept: true);
+}
+
+void DoInteractiveOpen()
+{
+    var number = PickProblemInteractively("Which problem do you want to open?");
+    if (number is null) return;
+
+    OpenProblem(number.Value);
+    AnsiConsole.MarkupLine("[dim]Press any key to continue…[/]");
+    Console.ReadKey(intercept: true);
+}
+
+void OpenProblem(int number)
+{
+    var row = tracker.GetByProblemNumber(number);
+    if (row is null)
+    {
+        PrintError($"Problem #{number} is not in the tracker DB. Run --import first or use --log to add it.");
+        return;
+    }
+    if (string.IsNullOrWhiteSpace(row.Link))
+    {
+        PrintError($"Problem #{number} has no link. Set one via --log {number} --link \"<url>\".");
+        return;
+    }
+
+    if (plain)
+        Console.WriteLine($"Opening {row.Link}");
+    else
+        AnsiConsole.MarkupLine($"[green]Opening[/] [dim]{Markup.Escape(row.Link)}[/]");
+
+    try
+    {
+        Process.Start(new ProcessStartInfo(row.Link) { UseShellExecute = true });
+    }
+    catch (Exception ex)
+    {
+        PrintError($"Failed to launch browser: {ex.Message}");
     }
 }
 
@@ -224,20 +342,36 @@ void ShowSummary()
         return;
     }
 
+    var trackedByNumber = tracker.GetAllByProblemNumber();
+
+    string LastReviewFor(CardInterval card)
+    {
+        var parsed = ProblemParser.Parse(card.SortField);
+        if (parsed is null) return "";
+        if (!trackedByNumber.TryGetValue(parsed.Number, out var problem)) return "";
+        if (!problem.LastReviewed.HasValue) return "";
+        return problem.LastReviewed.Value.LocalDateTime.ToString("MM-dd-yy h:mm:ss tt");
+    }
+
     var intervals = cards.Select(c => c.Interval).ToList();
     double mean = intervals.Average();
     double median = CalculateMedian(intervals);
 
     if (plain)
     {
-        Console.WriteLine($"{"Card",-60} {"Interval (days)",15} {"Due",10}");
-        Console.WriteLine(new string('-', 87));
+        int dashWidth = hideLastReview ? 87 : 108;
+        var header = $"{"Card",-60} {"Interval (days)",15} {"Due",10}";
+        if (!hideLastReview) header += $" {"Last Review",20}";
+        Console.WriteLine(header);
+        Console.WriteLine(new string('-', dashWidth));
         foreach (var card in cards)
         {
             var label = Truncate(card.SortField, 58);
-            Console.WriteLine($"{label,-60} {card.Interval,15} {card.Due.ToString("MM-dd-yy"),10}");
+            var line = $"{label,-60} {card.Interval,15} {card.Due.ToString("MM-dd-yy"),10}";
+            if (!hideLastReview) line += $" {LastReviewFor(card),20}";
+            Console.WriteLine(line);
         }
-        Console.WriteLine(new string('-', 87));
+        Console.WriteLine(new string('-', dashWidth));
         Console.WriteLine($"{"Cards: " + cards.Count,-60}");
         Console.WriteLine($"{"Mean:",-60} {mean,15:F1}");
         Console.WriteLine($"{"Median:",-60} {median,15:F1}");
@@ -251,6 +385,8 @@ void ShowSummary()
         table.AddColumn(new TableColumn("[bold]Card[/]").Width(60));
         table.AddColumn(new TableColumn("[bold]Interval (days)[/]").RightAligned());
         table.AddColumn(new TableColumn("[bold]Due[/]").RightAligned());
+        if (!hideLastReview)
+            table.AddColumn(new TableColumn("[bold]Last Review[/]").RightAligned());
 
         foreach (var card in cards)
         {
@@ -261,13 +397,31 @@ void ShowSummary()
                 >= 21 => $"[blue]{card.Interval}[/]",
                 _ => $"[yellow]{card.Interval}[/]"
             };
-            table.AddRow(label, ivlText, $"{card.Due.ToString("MM-dd-yy")}");
+            if (hideLastReview)
+            {
+                table.AddRow(label, ivlText, card.Due.ToString("MM-dd-yy"));
+            }
+            else
+            {
+                var lastReview = LastReviewFor(card);
+                var lastReviewText = lastReview.Length == 0 ? "[dim]—[/]" : lastReview;
+                table.AddRow(label, ivlText, card.Due.ToString("MM-dd-yy"), lastReviewText);
+            }
         }
 
         table.AddEmptyRow();
-        table.AddRow("[dim]Cards[/]", $"[dim]{cards.Count}[/]", "");
-        table.AddRow("[bold]Mean[/]", $"[bold]{mean:F1}[/]", "");
-        table.AddRow("[bold]Median[/]", $"[bold]{median:F1}[/]", "");
+        if (hideLastReview)
+        {
+            table.AddRow("[dim]Cards[/]", $"[dim]{cards.Count}[/]", "");
+            table.AddRow("[bold]Mean[/]", $"[bold]{mean:F1}[/]", "");
+            table.AddRow("[bold]Median[/]", $"[bold]{median:F1}[/]", "");
+        }
+        else
+        {
+            table.AddRow("[dim]Cards[/]", $"[dim]{cards.Count}[/]", "", "");
+            table.AddRow("[bold]Mean[/]", $"[bold]{mean:F1}[/]", "", "");
+            table.AddRow("[bold]Median[/]", $"[bold]{median:F1}[/]", "", "");
+        }
 
         AnsiConsole.Write(table);
     }
@@ -316,5 +470,7 @@ void PrintUsage()
     Console.WriteLine("      --link <url>    URL for the logged problem");
     Console.WriteLine("      --anki-id <id>  Anki card id to associate with the problem");
     Console.WriteLine("  --import             Sync problems from the Anki deck into the tracker DB");
+    Console.WriteLine("  -o, --open <N>       Open LeetCode problem #N in the default browser");
+    Console.WriteLine("  --no-last-review     Hide the Last Review column in the main display");
     Console.WriteLine("  --help, -h           Show this help");
 }

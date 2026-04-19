@@ -164,6 +164,24 @@ class LeetcodeRepository : IDisposable
         return existed ? UpsertResult.Updated : UpsertResult.Inserted;
     }
 
+    public Dictionary<int, LeetcodeProblem> GetAllByProblemNumber()
+    {
+        using var cmd = _conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT ProblemId, ProblemNumber, Description, Link, AnkiCardId, LastReviewed, CreatedAt
+            FROM LeetcodeProblems
+            """;
+
+        var result = new Dictionary<int, LeetcodeProblem>();
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var problem = ReadProblem(reader);
+            result[problem.ProblemNumber] = problem;
+        }
+        return result;
+    }
+
     public LeetcodeProblem? GetByProblemNumber(int problemNumber)
     {
         using var cmd = _conn.CreateCommand();

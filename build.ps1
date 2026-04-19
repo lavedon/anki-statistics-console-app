@@ -5,6 +5,7 @@ $dst = "C:\tools\as.exe"
 
 try {
     Copy-Item -Path $src -Destination $dst -Force
+    copy-Item -Path "C:\my-coding-projects\ankiStats\bin\Debug\net10.0\Data\leetcode.db" -Destination "C:\Tools\Data" -Force
     Write-Host "Published to $dst" -ForegroundColor Green
 } catch {
     Write-Host "File locked, stopping ankiStats process..." -ForegroundColor Yellow
