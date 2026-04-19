@@ -3,7 +3,7 @@ using Spectre.Console;
 
 bool plain = false;
 bool interactive = false;
-bool sortByDue = false;
+SortMode sortMode = SortMode.Interval;
 int? logProblemNumber = null;
 string? logDescription = null;
 string? logLink = null;
@@ -24,7 +24,10 @@ for (int i = 0; i < args.Length; i++)
             interactive = true;
             break;
         case "due" or "d":
-            sortByDue = true;
+            sortMode = SortMode.Due;
+            break;
+        case "last-review":
+            sortMode = SortMode.LastReview;
             break;
         case "log" or "l":
             if (i + 1 >= args.Length || !int.TryParse(args[++i], out int parsedNum))
@@ -221,14 +224,18 @@ void RunInteractive()
         var choice = AnsiConsole.Prompt(
             new SelectionPrompt<string>()
                 .Title("What would you like to do?")
-                .AddChoices("Log Review", "Open in Browser", "Refresh", "Sort by Interval", "Sort by Due", toggleLabel, "Exit"));
+                .AddChoices("Log Review", "Open in Browser", "Refresh",
+                    "Sort by Interval", "Sort by Due", "Sort by Last Review",
+                    toggleLabel, "Exit"));
 
         if (choice == "Exit")
             break;
         if (choice == "Sort by Due")
-            sortByDue = true;
+            sortMode = SortMode.Due;
         else if (choice == "Sort by Interval")
-            sortByDue = false;
+            sortMode = SortMode.Interval;
+        else if (choice == "Sort by Last Review")
+            sortMode = SortMode.LastReview;
         else if (choice == toggleLabel)
             hideLastReview = !hideLastReview;
         else if (choice == "Log Review")
@@ -240,9 +247,22 @@ void RunInteractive()
 
 int? PickProblemInteractively(string title)
 {
-    var currentCards = sortByDue
-        ? repo.GetCardIntervals().OrderBy(c => c.Due).ToList()
-        : repo.GetCardIntervals();
+    var rawCards = repo.GetCardIntervals();
+    var trackedByNumber = tracker.GetAllByProblemNumber();
+
+    DateTimeOffset? LastReview(CardInterval c)
+    {
+        var parsed = ProblemParser.Parse(c.SortField);
+        if (parsed is null) return null;
+        return trackedByNumber.TryGetValue(parsed.Number, out var p) ? p.LastReviewed : null;
+    }
+
+    var currentCards = sortMode switch
+    {
+        SortMode.Due => rawCards.OrderBy(c => c.Due).ToList(),
+        SortMode.LastReview => rawCards.OrderByDescending(LastReview).ToList(),
+        _ => rawCards
+    };
 
     var labelToNumber = new Dictionary<string, int>();
     foreach (var card in currentCards)
@@ -332,11 +352,9 @@ void OpenProblem(int number)
 
 void ShowSummary()
 {
-    var cards = sortByDue
-        ? repo.GetCardIntervals().OrderBy(c => c.Due).ToList()
-        : repo.GetCardIntervals();
+    var rawCards = repo.GetCardIntervals();
 
-    if (cards.Count == 0)
+    if (rawCards.Count == 0)
     {
         PrintWarning("No cards found for the target deck.");
         return;
@@ -344,14 +362,26 @@ void ShowSummary()
 
     var trackedByNumber = tracker.GetAllByProblemNumber();
 
-    string LastReviewFor(CardInterval card)
+    DateTimeOffset? LastReviewTimestamp(CardInterval card)
     {
         var parsed = ProblemParser.Parse(card.SortField);
-        if (parsed is null) return "";
-        if (!trackedByNumber.TryGetValue(parsed.Number, out var problem)) return "";
-        if (!problem.LastReviewed.HasValue) return "";
-        return problem.LastReviewed.Value.LocalDateTime.ToString("MM-dd-yy h:mm:ss tt");
+        if (parsed is null) return null;
+        if (!trackedByNumber.TryGetValue(parsed.Number, out var problem)) return null;
+        return problem.LastReviewed;
     }
+
+    string LastReviewFor(CardInterval card)
+    {
+        var ts = LastReviewTimestamp(card);
+        return ts.HasValue ? ts.Value.LocalDateTime.ToString("MM-dd-yy h:mm:ss tt") : "";
+    }
+
+    var cards = sortMode switch
+    {
+        SortMode.Due => rawCards.OrderBy(c => c.Due).ToList(),
+        SortMode.LastReview => rawCards.OrderByDescending(LastReviewTimestamp).ToList(),
+        _ => rawCards
+    };
 
     var intervals = cards.Select(c => c.Interval).ToList();
     double mean = intervals.Average();
@@ -464,7 +494,8 @@ void PrintUsage()
     Console.WriteLine("Options:");
     Console.WriteLine("  --plain              Plain text output (no colors/tables)");
     Console.WriteLine("  --interactive        Interactive mode");
-    Console.WriteLine("  -d, --due            Sort by due date (default: sort by interval)");
+    Console.WriteLine("  -d, --due            Sort by Anki due date (default: sort by interval)");
+    Console.WriteLine("  --last-review        Sort by our Last Review column (most recent first)");
     Console.WriteLine("  -l, --log <N>        Log a review for LeetCode problem #N");
     Console.WriteLine("      --desc <text>   Description for the logged problem");
     Console.WriteLine("      --link <url>    URL for the logged problem");
