@@ -4,6 +4,7 @@ using Spectre.Console;
 bool plain = false;
 bool interactive = false;
 SortMode sortMode = SortMode.Interval;
+bool reverseSort = false;
 int? logProblemNumber = null;
 string? logDescription = null;
 string? logLink = null;
@@ -29,6 +30,9 @@ for (int i = 0; i < args.Length; i++)
         case "last-review":
             sortMode = SortMode.LastReview;
             break;
+        case "desc":
+            reverseSort = true;
+            break;
         case "log" or "l":
             if (i + 1 >= args.Length || !int.TryParse(args[++i], out int parsedNum))
             {
@@ -37,10 +41,10 @@ for (int i = 0; i < args.Length; i++)
             }
             logProblemNumber = parsedNum;
             break;
-        case "desc":
+        case "description":
             if (i + 1 >= args.Length)
             {
-                PrintError("--desc requires a value");
+                PrintError("--description requires a value");
                 return 1;
             }
             logDescription = args[++i];
@@ -221,12 +225,19 @@ void RunInteractive()
 
         var toggleLabel = hideLastReview ? "Show Last Review column" : "Hide Last Review column";
 
+        bool currentlyDesc = sortMode switch
+        {
+            SortMode.Due => reverseSort,
+            _            => !reverseSort
+        };
+        var sortDirLabel = currentlyDesc ? "Sort Ascending" : "Sort Descending";
+
         var choice = AnsiConsole.Prompt(
             new SelectionPrompt<string>()
                 .Title("What would you like to do?")
                 .AddChoices("Log Review", "Open in Browser", "Refresh",
                     "Sort by Interval", "Sort by Due", "Sort by Last Review",
-                    toggleLabel, "Exit"));
+                    sortDirLabel, toggleLabel, "Exit"));
 
         if (choice == "Exit")
             break;
@@ -238,6 +249,8 @@ void RunInteractive()
             sortMode = SortMode.LastReview;
         else if (choice == toggleLabel)
             hideLastReview = !hideLastReview;
+        else if (choice == sortDirLabel)
+            reverseSort = !reverseSort;
         else if (choice == "Log Review")
             DoInteractiveLog();
         else if (choice == "Open in Browser")
@@ -257,11 +270,14 @@ int? PickProblemInteractively(string title)
         return trackedByNumber.TryGetValue(parsed.Number, out var p) ? p.LastReviewed : null;
     }
 
-    var currentCards = sortMode switch
+    var currentCards = (sortMode, reverseSort) switch
     {
-        SortMode.Due => rawCards.OrderBy(c => c.Due).ToList(),
-        SortMode.LastReview => rawCards.OrderByDescending(LastReview).ToList(),
-        _ => rawCards
+        (SortMode.Interval,    true)  => rawCards.OrderBy(c => c.Interval).ToList(),
+        (SortMode.Due,         false) => rawCards.OrderBy(c => c.Due).ToList(),
+        (SortMode.Due,         true)  => rawCards.OrderByDescending(c => c.Due).ToList(),
+        (SortMode.LastReview,  false) => rawCards.OrderByDescending(LastReview).ToList(),
+        (SortMode.LastReview,  true)  => rawCards.OrderBy(LastReview).ToList(),
+        _                             => rawCards
     };
 
     var labelToNumber = new Dictionary<string, int>();
@@ -376,11 +392,14 @@ void ShowSummary()
         return ts.HasValue ? ts.Value.LocalDateTime.ToString("MM-dd-yy h:mm:ss tt") : "";
     }
 
-    var cards = sortMode switch
+    var cards = (sortMode, reverseSort) switch
     {
-        SortMode.Due => rawCards.OrderBy(c => c.Due).ToList(),
-        SortMode.LastReview => rawCards.OrderByDescending(LastReviewTimestamp).ToList(),
-        _ => rawCards
+        (SortMode.Interval,    true)  => rawCards.OrderBy(c => c.Interval).ToList(),
+        (SortMode.Due,         false) => rawCards.OrderBy(c => c.Due).ToList(),
+        (SortMode.Due,         true)  => rawCards.OrderByDescending(c => c.Due).ToList(),
+        (SortMode.LastReview,  false) => rawCards.OrderByDescending(LastReviewTimestamp).ToList(),
+        (SortMode.LastReview,  true)  => rawCards.OrderBy(LastReviewTimestamp).ToList(),
+        _                             => rawCards
     };
 
     var intervals = cards.Select(c => c.Interval).ToList();
@@ -496,8 +515,9 @@ void PrintUsage()
     Console.WriteLine("  --interactive        Interactive mode");
     Console.WriteLine("  -d, --due            Sort by Anki due date (default: sort by interval)");
     Console.WriteLine("  --last-review        Sort by our Last Review column (most recent first)");
+    Console.WriteLine("  --desc               Reverse the sort direction from the column's default");
     Console.WriteLine("  -l, --log <N>        Log a review for LeetCode problem #N");
-    Console.WriteLine("      --desc <text>   Description for the logged problem");
+    Console.WriteLine("      --description <text>  Description for the logged problem");
     Console.WriteLine("      --link <url>    URL for the logged problem");
     Console.WriteLine("      --anki-id <id>  Anki card id to associate with the problem");
     Console.WriteLine("  --import             Sync problems from the Anki deck into the tracker DB");
